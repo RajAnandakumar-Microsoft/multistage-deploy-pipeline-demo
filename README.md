@@ -26,6 +26,13 @@ gates**, **post-deploy health checks**, and **automatic `helm rollback` on failu
    reviewers so each wave pauses for approval.
 3. Watch the image get built once and promoted through all four waves, approving each gate.
 
+## Demo the rollback
+
+Run **Demo Pipeline (kind, no cloud)** from the **Actions** tab and set **simulate_failure_wave** to a
+wave (for example `dev`). That wave installs a healthy baseline, then a broken upgrade, so you watch the
+health check fail, `helm rollback` restore the good version, and promotion stop. Leave it as `none` for a
+normal green run.
+
 ## How it works
 
 - **Build once, promote the same image.** The build job produces one image; every wave deploys that

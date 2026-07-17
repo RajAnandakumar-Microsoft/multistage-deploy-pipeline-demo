@@ -33,6 +33,11 @@ on:
         required: false
         type: string
         default: 120s
+      simulate_failure:
+        description: If true, deploy a healthy baseline then a broken upgrade so the automatic rollback fires (for demos).
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -66,9 +71,11 @@ jobs:
       - name: Set up Helm
         uses: azure/setup-helm@v4
 
-      - name: Deploy with Helm
+      - name: Deploy a healthy baseline first (rollback demo only)
+        if: ${{ inputs.simulate_failure }}
         run: |
           set -euo pipefail
+          echo "Rollback demo: installing a known-good baseline (revision 1) so the rollback has a healthy version to restore."
           helm upgrade --install "${{ inputs.release_name }}" ./chart \
             --namespace "${{ inputs.namespace }}" --create-namespace \
             --values "${{ inputs.values_file }}" \
@@ -76,6 +83,24 @@ jobs:
             --set image.tag="${{ inputs.image_tag }}" \
             --set image.pullPolicy=Never \
             --wait --timeout "${{ inputs.health_timeout }}"
+
+      - name: Deploy with Helm
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.image_tag }}"
+          timeout="${{ inputs.health_timeout }}"
+          if [ "${{ inputs.simulate_failure }}" = "true" ]; then
+            echo "::warning::Failure simulation ON: deploying a broken image tag so the health check fails and triggers a rollback."
+            tag="${{ inputs.image_tag }}-broken-demo"
+            timeout="60s"
+          fi
+          helm upgrade --install "${{ inputs.release_name }}" ./chart \
+            --namespace "${{ inputs.namespace }}" --create-namespace \
+            --values "${{ inputs.values_file }}" \
+            --set image.repository=sample-app \
+            --set image.tag="$tag" \
+            --set image.pullPolicy=Never \
+            --wait --timeout "$timeout"
 
       - name: Health check (rollout status)
         run: |

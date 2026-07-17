@@ -10,6 +10,17 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      simulate_failure_wave:
+        description: "Force this wave to fail so you can watch the automatic rollback. Leave as none for a normal green run."
+        type: choice
+        default: none
+        options:
+          - none
+          - dev
+          - site
+          - additional-sites
+          - regional
 
 permissions:
   contents: read
@@ -50,6 +61,7 @@ jobs:
       namespace: hello-world-dev
       image_tag: ${{ needs.build.outputs.image_tag }}
       values_file: chart/values-dev.yaml
+      simulate_failure: ${{ inputs.simulate_failure_wave == 'dev' }}
 
   deploy-site:
     name: Wave 2 - Site (canary)
@@ -60,6 +72,7 @@ jobs:
       namespace: hello-world-site
       image_tag: ${{ needs.build.outputs.image_tag }}
       values_file: chart/values-site.yaml
+      simulate_failure: ${{ inputs.simulate_failure_wave == 'site' }}
 
   deploy-additional-sites:
     name: Wave 3 - Additional sites
@@ -70,6 +83,7 @@ jobs:
       namespace: hello-world-sites
       image_tag: ${{ needs.build.outputs.image_tag }}
       values_file: chart/values-additional-sites.yaml
+      simulate_failure: ${{ inputs.simulate_failure_wave == 'additional-sites' }}
 
   deploy-regional:
     name: Wave 4 - Regional rollout
@@ -80,3 +94,4 @@ jobs:
       namespace: hello-world-regional
       image_tag: ${{ needs.build.outputs.image_tag }}
       values_file: chart/values-region.yaml
+      simulate_failure: ${{ inputs.simulate_failure_wave == 'regional' }}
