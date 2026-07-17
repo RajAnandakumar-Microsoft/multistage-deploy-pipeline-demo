@@ -36,7 +36,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
 
 jobs:
   deploy:
@@ -50,16 +49,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Manual approval gate (comment on the issue to approve)
-        uses: trstringer/manual-approval@v1
-        with:
-          secret: ${{ secrets.GITHUB_TOKEN }}
-          approvers: RajAnandakumar-Microsoft
-          minimum-approvals: 1
-          issue-title: "Approve promotion to ${{ inputs.environment }}"
-          issue-body: "Deployment to ${{ inputs.environment }} is awaiting approval. Comment approved to promote, or denied to stop and roll back."
-          exclude-workflow-initiator-as-approver: false
 
       - name: Download the built image
         uses: actions/download-artifact@v4
