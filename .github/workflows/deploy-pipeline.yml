@@ -1,0 +1,102 @@
+name: Multi-Stage Deployment Pipeline
+
+# Orchestrates the progressive deployment waves:
+#   Build -> Dev -> Site (canary) -> Additional Sites -> Regional
+# Each wave runs only after the previous one succeeds (needs:), and each calls
+# the reusable deploy workflow, which handles Helm deploy + health check +
+# automatic rollback. Manual approval gates are enforced via GitHub Environments
+# (configure required reviewers on dev/site/additional-sites/regional).
+
+on:
+  # Manual-only in this demo repo so the cloud pipeline does not auto-run (it needs
+  # Azure/OIDC/AKS). In your environment, add:  push: { branches: [main] }
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build:
+    name: Build & push image
+    runs-on: ubuntu-latest
+    outputs:
+      image_repository: ${{ steps.meta.outputs.image_repository }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build & push image to ACR
+        run: |
+          set -euo pipefail
+          az acr build \
+            --registry "${{ vars.ACR_NAME }}" \
+            --image "hello-world:${{ github.sha }}" \
+            ./app
+
+      - name: Export image metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          echo "image_repository=${{ vars.ACR_LOGIN_SERVER }}/hello-world" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+  deploy-dev:
+    name: Wave 1 — Dev
+    needs: build
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      environment: dev
+      cluster_name: ${{ vars.DEV_CLUSTER_NAME }}
+      resource_group: ${{ vars.DEV_RESOURCE_GROUP }}
+      namespace: hello-world-dev
+      image_repository: ${{ needs.build.outputs.image_repository }}
+      image_tag: ${{ needs.build.outputs.image_tag }}
+      values_file: chart/values-dev.yaml
+
+  deploy-site:
+    name: Wave 2 — Site (canary)
+    needs: [build, deploy-dev]
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      environment: site
+      cluster_name: ${{ vars.SITE_CLUSTER_NAME }}
+      resource_group: ${{ vars.SITE_RESOURCE_GROUP }}
+      namespace: hello-world-site
+      image_repository: ${{ needs.build.outputs.image_repository }}
+      image_tag: ${{ needs.build.outputs.image_tag }}
+      values_file: chart/values-site.yaml
+
+  deploy-additional-sites:
+    name: Wave 3 — Additional sites
+    needs: [build, deploy-site]
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      environment: additional-sites
+      cluster_name: ${{ vars.SITES_CLUSTER_NAME }}
+      resource_group: ${{ vars.SITES_RESOURCE_GROUP }}
+      namespace: hello-world-sites
+      image_repository: ${{ needs.build.outputs.image_repository }}
+      image_tag: ${{ needs.build.outputs.image_tag }}
+      values_file: chart/values-additional-sites.yaml
+
+  deploy-regional:
+    name: Wave 4 — Regional rollout
+    needs: [build, deploy-additional-sites]
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      environment: regional
+      cluster_name: ${{ vars.REGIONAL_CLUSTER_NAME }}
+      resource_group: ${{ vars.REGIONAL_RESOURCE_GROUP }}
+      namespace: hello-world-regional
+      image_repository: ${{ needs.build.outputs.image_repository }}
+      image_tag: ${{ needs.build.outputs.image_tag }}
+      values_file: chart/values-region.yaml

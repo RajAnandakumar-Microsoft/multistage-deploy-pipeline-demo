@@ -1,0 +1,82 @@
+name: Demo Pipeline (kind, no cloud)
+
+# A self-contained demo of the multi-stage deployment flow that runs entirely on
+# GitHub-hosted runners. It builds the image once and promotes that same image
+# through four gated waves, deploying to an ephemeral kind (Kubernetes-in-Docker)
+# cluster that stands in for AKS. No Azure, OIDC, ACR, or real cluster required.
+# The cloud version is deploy-pipeline.yml.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build image (once)
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t "sample-app:${{ github.sha }}" ./app
+
+      - name: Save image as an artifact (promoted unchanged through every wave)
+        run: docker save "sample-app:${{ github.sha }}" -o image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-image
+          path: image.tar
+          retention-days: 1
+
+      - name: Export image metadata
+        id: meta
+        run: echo "image_tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+  deploy-dev:
+    name: Wave 1 - Dev
+    needs: build
+    uses: ./.github/workflows/reusable-demo-deploy.yml
+    with:
+      environment: dev
+      namespace: hello-world-dev
+      image_tag: ${{ needs.build.outputs.image_tag }}
+      values_file: chart/values-dev.yaml
+
+  deploy-site:
+    name: Wave 2 - Site (canary)
+    needs: [build, deploy-dev]
+    uses: ./.github/workflows/reusable-demo-deploy.yml
+    with:
+      environment: site
+      namespace: hello-world-site
+      image_tag: ${{ needs.build.outputs.image_tag }}
+      values_file: chart/values-site.yaml
+
+  deploy-additional-sites:
+    name: Wave 3 - Additional sites
+    needs: [build, deploy-site]
+    uses: ./.github/workflows/reusable-demo-deploy.yml
+    with:
+      environment: additional-sites
+      namespace: hello-world-sites
+      image_tag: ${{ needs.build.outputs.image_tag }}
+      values_file: chart/values-additional-sites.yaml
+
+  deploy-regional:
+    name: Wave 4 - Regional rollout
+    needs: [build, deploy-additional-sites]
+    uses: ./.github/workflows/reusable-demo-deploy.yml
+    with:
+      environment: regional
+      namespace: hello-world-regional
+      image_tag: ${{ needs.build.outputs.image_tag }}
+      values_file: chart/values-region.yaml

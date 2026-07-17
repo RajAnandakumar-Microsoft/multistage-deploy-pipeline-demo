@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Helm
+*.tgz
+chart/charts/
+
+# Kubernetes / local
+kubeconfig
+*.kubeconfig
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Internal working docs (kept local, not part of the shared sample)
+/REQUIREMENTS.md
+/.github/copilot-instructions.md
+/docs/

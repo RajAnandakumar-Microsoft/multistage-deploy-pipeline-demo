@@ -1,0 +1,186 @@
+name: Reusable Deploy
+
+# Reusable workflow that deploys ONE environment with Helm, validates health,
+# and rolls back automatically on failure. Called once per wave by
+# deploy-pipeline.yml. Parameterized so the same logic serves every site/region.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub Environment + logical stage name (dev, site, additional-sites, regional).
+        required: true
+        type: string
+      cluster_name:
+        description: Target AKS cluster name.
+        required: true
+        type: string
+      resource_group:
+        description: Resource group of the AKS cluster.
+        required: true
+        type: string
+      namespace:
+        description: Kubernetes namespace to deploy into.
+        required: true
+        type: string
+      image_repository:
+        description: Full image repository path (e.g. <acr>.azurecr.io/hello-world).
+        required: true
+        type: string
+      image_tag:
+        description: Image tag to deploy (commit SHA).
+        required: true
+        type: string
+      values_file:
+        description: Helm values file for this environment.
+        required: true
+        type: string
+      release_name:
+        description: Helm release name.
+        required: false
+        type: string
+        default: hello-world
+      health_timeout:
+        description: Timeout for Helm wait and the post-deploy health check.
+        required: false
+        type: string
+        default: 120s
+      enable_azure_monitor:
+        description: Gate promotion on an Azure Monitor metric after deploy, in addition to the k8s rollout check.
+        required: false
+        type: boolean
+        default: true
+      azure_monitor_cpu_threshold:
+        description: Fail the stage and roll back if the cluster's average CPU percent exceeds this after deploy.
+        required: false
+        type: string
+        default: "95"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    # Binds this stage to a GitHub Environment. Configure required reviewers on
+    # the environment to enforce the manual approval gate before promotion.
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Get AKS credentials
+        run: |
+          set -euo pipefail
+          az aks get-credentials \
+            --resource-group "${{ inputs.resource_group }}" \
+            --name "${{ inputs.cluster_name }}" \
+            --overwrite-existing
+
+      - name: Deploy with Helm
+        run: |
+          set -euo pipefail
+          helm upgrade --install "${{ inputs.release_name }}" ./chart \
+            --namespace "${{ inputs.namespace }}" --create-namespace \
+            --values "${{ inputs.values_file }}" \
+            --set image.repository="${{ inputs.image_repository }}" \
+            --set image.tag="${{ inputs.image_tag }}" \
+            --wait --timeout "${{ inputs.health_timeout }}"
+
+      - name: Health check (rollout status)
+        run: |
+          set -euo pipefail
+          deploy_name=$(kubectl -n "${{ inputs.namespace }}" get deploy \
+            -l app.kubernetes.io/instance="${{ inputs.release_name }}" \
+            -o jsonpath='{.items[0].metadata.name}')
+          echo "Validating rollout of deployment/${deploy_name} in ${{ inputs.namespace }}"
+          kubectl -n "${{ inputs.namespace }}" rollout status \
+            "deployment/${deploy_name}" --timeout "${{ inputs.health_timeout }}"
+
+      # Azure Monitor health gate: after the k8s rollout succeeds, pull a live
+      # cluster metric from Azure Monitor and fail the stage (which triggers the
+      # rollback step below) if it breaches the threshold. Brings Azure Monitor
+      # into the promotion loop: telemetry, health verification, and a rollback
+      # trigger. Point it at app-specific metrics or fired alerts for production.
+      - name: Azure Monitor health gate
+        if: ${{ inputs.enable_azure_monitor }}
+        run: |
+          set -euo pipefail
+          aks_id="/subscriptions/${{ vars.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${{ inputs.resource_group }}/providers/Microsoft.ContainerService/managedClusters/${{ inputs.cluster_name }}"
+
+          # Latest non-null average CPU percent for the cluster. Fail open if it is
+          # unavailable, since the k8s rollout check already validated health.
+          cpu=$(az monitor metrics list \
+            --resource "$aks_id" \
+            --metric node_cpu_usage_percentage \
+            --aggregation Average \
+            --interval PT1M \
+            --query "value[0].timeseries[0].data[].average" \
+            -o tsv 2>/dev/null | grep -vE '^(None)?$' | tail -n1 || echo "")
+
+          if [ -z "$cpu" ] || [ "$cpu" = "None" ]; then
+            echo "::warning::No Azure Monitor datapoint available; skipping the metric gate."
+            exit 0
+          fi
+
+          threshold="${{ inputs.azure_monitor_cpu_threshold }}"
+          echo "Azure Monitor: cluster average CPU ${cpu}% (threshold ${threshold}%)"
+          echo "- Azure Monitor cluster CPU: ${cpu}% (threshold ${threshold}%)" >> "$GITHUB_STEP_SUMMARY"
+
+          # Breach of the threshold fails the stage, which triggers the rollback step.
+          if awk -v c="$cpu" -v t="$threshold" 'BEGIN { exit (c+0 > t+0) ? 0 : 1 }'; then
+            echo "::error::Azure Monitor health gate failed: CPU ${cpu}% exceeded ${threshold}%."
+            exit 1
+          fi
+          echo "Azure Monitor health gate passed."
+
+      - name: Roll back on failure
+        if: failure()
+        run: |
+          set -euo pipefail
+          echo "::warning::Deploy/health check to ${{ inputs.environment }} failed — rolling back"
+          # Roll back to the previous deployed revision if one exists; otherwise
+          # remove the failed initial release so nothing broken is left behind.
+          revisions=$(helm history "${{ inputs.release_name }}" \
+            --namespace "${{ inputs.namespace }}" -o json 2>/dev/null \
+            | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' || echo 0)
+          if [ "${revisions}" -ge 2 ]; then
+            helm rollback "${{ inputs.release_name }}" 0 \
+              --namespace "${{ inputs.namespace }}" \
+              --wait --timeout "${{ inputs.health_timeout }}"
+            echo "Rolled back ${{ inputs.release_name }} to the previous good revision."
+          else
+            helm uninstall "${{ inputs.release_name }}" \
+              --namespace "${{ inputs.namespace }}" || true
+            echo "No previous revision to roll back to; removed the failed initial release."
+          fi
+
+      - name: Stage summary
+        if: always()
+        run: |
+          {
+            echo "### Deploy to ${{ inputs.environment }}"
+            echo ""
+            echo "- Cluster: \`${{ inputs.cluster_name }}\` (rg: \`${{ inputs.resource_group }}\`)"
+            echo "- Namespace: \`${{ inputs.namespace }}\`"
+            echo "- Image: \`${{ inputs.image_repository }}:${{ inputs.image_tag }}\`"
+            echo "- Result: **${{ job.status }}**"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,3 @@
+# Wave 2 — Site: low-impact canary (first real site).
+replicaCount: 2
+appEnv: site

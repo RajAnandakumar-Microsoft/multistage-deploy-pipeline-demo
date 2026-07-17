@@ -1,0 +1,3 @@
+# Wave 3 — Additional sites: broader rollout.
+replicaCount: 2
+appEnv: additional-sites
